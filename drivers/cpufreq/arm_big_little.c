@@ -153,11 +153,11 @@ bL_cpufreq_set_rate_cluster(u32 cpu, u32 cluster, u32 new_rate)
 		opp_freq = dev_pm_opp_get_freq(opp);
 		rcu_read_unlock();
 		volt_old = regulator_get_voltage(reg[cluster]);
-		pr_debug("%s: cpu %d, cluster: %d, Found OPP: %ld kHz, %ld uV\n",
+		pr_info("%s: cpu %d, cluster: %d, Found OPP: %ld kHz, %ld uV\n",
 			__func__, cpu, cluster, opp_freq / 1000, volt);
 	}
 
-	pr_debug("%s: cpu %d, cluster: %d, %u MHz, %ld mV --> %u MHz, %ld mV\n",
+	pr_info("%s: cpu %d, cluster: %d, %u MHz, %ld mV --> %u MHz, %ld mV\n",
 		__func__, cpu, cluster,
 		old_rate / 1000, (volt_old > 0) ? volt_old / 1000 : -1,
 		new_rate / 1000, volt ? volt / 1000 : -1);
@@ -215,7 +215,7 @@ bL_cpufreq_set_rate(u32 cpu, u32 old_cluster, u32 new_cluster, u32 rate)
 		new_rate = rate;
 	}
 
-	pr_debug("%s: cpu: %d, old cluster: %d, new cluster: %d, freq: %d\n",
+	pr_info("%s: cpu: %d, old cluster: %d, new cluster: %d, freq: %d\n",
 			__func__, cpu, old_cluster, new_cluster, new_rate);
 
 	ret = bL_cpufreq_set_rate_cluster(cpu, new_cluster, new_rate);
@@ -231,7 +231,7 @@ bL_cpufreq_set_rate(u32 cpu, u32 old_cluster, u32 new_cluster, u32 rate)
 
 	/* Recalc freq for old cluster when switching clusters */
 	if (old_cluster != new_cluster) {
-		pr_debug("%s: cpu: %d, old cluster: %d, new cluster: %d\n",
+		pr_info("%s: cpu: %d, old cluster: %d, new cluster: %d\n",
 				__func__, cpu, old_cluster, new_cluster);
 
 		/* Switch cluster */
@@ -243,7 +243,7 @@ bL_cpufreq_set_rate(u32 cpu, u32 old_cluster, u32 new_cluster, u32 rate)
 		new_rate = find_cluster_maxfreq(old_cluster);
 		new_rate = ACTUAL_FREQ(old_cluster, new_rate);
 		if (new_rate) {
-			pr_debug("%s: Updating rate of old cluster: %d, to freq: %d\n",
+			pr_info("%s: Updating rate of old cluster: %d, to freq: %d\n",
 					__func__, old_cluster, new_rate);
 
 			bL_cpufreq_set_rate_cluster(cpu, old_cluster, new_rate);
@@ -331,7 +331,7 @@ static int merge_cluster_tables(void)
 				j++) {
 			table[k].frequency = VIRT_FREQ(i,
 					freq_table[i][j].frequency);
-			pr_debug("%s: index: %d, freq: %d\n", __func__, k,
+			pr_info("%s: index: %d, freq: %d\n", __func__, k,
 					table[k].frequency);
 			k++;
 		}
@@ -340,7 +340,7 @@ static int merge_cluster_tables(void)
 	table[k].driver_data = k;
 	table[k].frequency = CPUFREQ_TABLE_END;
 
-	pr_debug("%s: End, table: %p, count: %d\n", __func__, table, k);
+	pr_info("%s: End, table: %p, count: %d\n", __func__, table, k);
 
 	return 0;
 }
@@ -457,7 +457,7 @@ static int _get_cluster_clk_and_freq_table(struct device *cpu_dev)
 
 	clk[cluster] = clk_get(cpu_dev, name);
 	if (!IS_ERR(clk[cluster])) {
-		dev_dbg(cpu_dev, "%s: clk: %p & freq table: %p, cluster: %d\n",
+		dev_info(cpu_dev, "%s: clk: %p & freq table: %p, cluster: %d\n",
 				__func__, clk[cluster], freq_table[cluster],
 				cluster);
 		return 0;
@@ -516,7 +516,7 @@ static int get_cluster_clk_and_freq_table(struct device *cpu_dev)
 	clk_big_min = get_table_min(freq_table[0]);
 	clk_little_max = VIRT_FREQ(1, get_table_max(freq_table[1]));
 
-	pr_debug("%s: cluster: %d, clk_big_min: %d, clk_little_max: %d\n",
+	pr_info("%s: cluster: %d, clk_big_min: %d, clk_little_max: %d\n",
 			__func__, cluster, clk_big_min, clk_little_max);
 
 	return 0;
@@ -568,11 +568,16 @@ static int bL_cpufreq_init(struct cpufreq_policy *policy)
 
 		cpumask_copy(policy->cpus, topology_core_cpumask(policy->cpu));
 
-		for_each_cpu(cpu, policy->cpus)
+		for_each_cpu(cpu, policy->cpus) {
 			per_cpu(physical_cluster, cpu) = cur_cluster;
+			dev_info(cpu_dev, "%s: CPU %d physical_cluster %d\n",
+				 __func__, cpu, cur_cluster);
+		}
 	} else {
 		/* Assumption: during init, we are always running on A15 */
-		per_cpu(physical_cluster, policy->cpu) = A15_CLUSTER;
+		per_cpu(physical_cluster, policy->cpu) = A15_CLUSTER;// A15_CLUSTER;
+		dev_info(cpu_dev, "%s: CPU %d physical_cluster is A15\n",
+			 __func__, policy->cpu);
 	}
 
 	if (arm_bL_ops->get_transition_latency)
