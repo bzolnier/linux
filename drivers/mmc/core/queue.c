@@ -9,6 +9,7 @@
  */
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/blk-mq.h>
 #include <linux/blkdev.h>
 #include <linux/freezer.h>
 #include <linux/kthread.h>
@@ -47,6 +48,21 @@ static int mmc_prep_request(struct request_queue *q, struct request *req)
 	return BLKPREP_OK;
 }
 
+static int mmc_mq_queue_ready(struct request_queue *q, struct mmc_queue *mq)
+{
+	unsigned int busy;
+
+	busy = atomic_inc_return(&mq->device_busy) - 1;
+
+	if (busy >= mq->qdepth)
+		goto out_dec;
+
+	return 1;
+out_dec:
+	atomic_dec(&mq->device_busy);
+	return 0;
+}
+
 struct mmc_queue_req *mmc_queue_req_find(struct mmc_queue *mq,
 					 struct request *req)
 {
@@ -74,6 +90,8 @@ void mmc_queue_req_free(struct mmc_queue *mq,
 	mqrq->req = NULL;
 	mq->qcnt -= 1;
 	__clear_bit(mqrq->task_id, &mq->qslots);
+	if (mmc_use_blk_mq())
+		atomic_dec(&mq->device_busy);
 }
 
 static int mmc_queue_thread(void *d)
@@ -108,7 +126,7 @@ static int mmc_queue_thread(void *d)
 
 		if (req || mq->qcnt) {
 			set_current_state(TASK_RUNNING);
-			mmc_blk_issue_rq(mq, req);
+			mmc_blk_issue_rq(mq, req, NULL);
 			cond_resched();
 		} else {
 			if (kthread_should_stop()) {
@@ -282,6 +300,44 @@ static struct mmc_queue_req *mmc_queue_alloc_mqrqs(int qdepth)
 	return mqrq;
 }
 
+static int mmc_init_request(void *data, struct request *rq,
+		unsigned int hctx_idx, unsigned int request_idx,
+		unsigned int numa_node)
+{
+	return 0;
+}
+
+static void mmc_exit_request(void *data, struct request *rq,
+		unsigned int hctx_idx, unsigned int request_idx)
+{
+}
+
+static int mmc_queue_rq(struct blk_mq_hw_ctx *hctx,
+			 const struct blk_mq_queue_data *bd)
+{
+	struct request *req = bd->rq;
+	struct request_queue *q = req->q;
+	struct mmc_queue *mq = q->queuedata;
+	struct mmc_queue_req *mqrq_cur;
+
+	WARN_ON(req && req->cmd_type != REQ_TYPE_FS);
+
+	if (!mmc_mq_queue_ready(q, mq))
+		return BLK_MQ_RQ_QUEUE_BUSY;
+
+	mqrq_cur = mmc_queue_req_find(mq, req);
+	BUG_ON(!mqrq_cur);
+	mmc_blk_issue_rq(mq, req, mqrq_cur);
+
+	return BLK_MQ_RQ_QUEUE_OK;
+}
+
+static struct blk_mq_ops mmc_mq_ops = {
+	.queue_rq	= mmc_queue_rq,
+	.init_request	= mmc_init_request,
+	.exit_request	= mmc_exit_request,
+};
+
 /**
  * mmc_init_queue - initialise a queue structure.
  * @mq: mmc queue
@@ -295,6 +351,7 @@ int mmc_init_queue(struct mmc_queue *mq, struct mmc_card *card,
 		   spinlock_t *lock, const char *subname)
 {
 	struct mmc_host *host = card->host;
+	struct request_queue *q;
 	u64 limit = BLK_BOUNCE_HIGH;
 	bool bounce = false;
 	int ret = -ENOMEM;
@@ -303,11 +360,36 @@ int mmc_init_queue(struct mmc_queue *mq, struct mmc_card *card,
 		limit = (u64)dma_max_pfn(mmc_dev(host)) << PAGE_SHIFT;
 
 	mq->card = card;
-	mq->queue = blk_init_queue(mmc_request_fn, lock);
-	if (!mq->queue)
-		return -ENOMEM;
+	if (!mmc_use_blk_mq()) {
+		mq->queue = blk_init_queue(mmc_request_fn, lock);
+		if (!mq->queue)
+			return -ENOMEM;
 
-	mq->qdepth = 2;
+		mq->qdepth = 2;
+	} else {
+		memset(&mq->tag_set, 0, sizeof(mq->tag_set));
+		mq->tag_set.ops = &mmc_mq_ops;
+		mq->tag_set.queue_depth = 1;
+		mq->tag_set.numa_node = NUMA_NO_NODE;
+		mq->tag_set.flags =
+			BLK_MQ_F_SHOULD_MERGE | BLK_MQ_F_SG_MERGE;
+		mq->tag_set.nr_hw_queues = 1;
+		mq->tag_set.cmd_size = sizeof(struct mmc_queue_req);
+
+		ret = blk_mq_alloc_tag_set(&mq->tag_set);
+		if (ret)
+			goto out;
+
+		q = blk_mq_init_queue(&mq->tag_set);
+		if (IS_ERR(q)) {
+			ret = PTR_ERR(q);
+			goto cleanup_tag_set;
+		}
+		mq->queue = q;
+
+		mq->qdepth = 1;
+	}
+
 	mq->mqrq = mmc_queue_alloc_mqrqs(mq->qdepth);
 	if (!mq->mqrq)
 		goto blk_cleanup;
@@ -359,6 +441,9 @@ int mmc_init_queue(struct mmc_queue *mq, struct mmc_card *card,
 			goto cleanup_queue;
 	}
 
+	if (mmc_use_blk_mq())
+		return 0;
+
 	sema_init(&mq->thread_sem, 1);
 
 	mq->thread = kthread_run(mmc_queue_thread, mq, "mmcqd/%d%s",
@@ -377,6 +462,10 @@ int mmc_init_queue(struct mmc_queue *mq, struct mmc_card *card,
 	mq->mqrq = NULL;
 blk_cleanup:
 	blk_cleanup_queue(mq->queue);
+cleanup_tag_set:
+	if (mmc_use_blk_mq())
+		blk_mq_free_tag_set(&mq->tag_set);
+out:
 	return ret;
 }
 
@@ -388,8 +477,10 @@ void mmc_cleanup_queue(struct mmc_queue *mq)
 	/* Make sure the queue isn't suspended, as that will deadlock */
 	mmc_queue_resume(mq);
 
-	/* Then terminate our worker thread */
-	kthread_stop(mq->thread);
+	if (!mmc_use_blk_mq()) {
+		/* Then terminate our worker thread */
+		kthread_stop(mq->thread);
+	}
 
 	/* Empty the queue */
 	spin_lock_irqsave(q->queue_lock, flags);
@@ -400,6 +491,9 @@ void mmc_cleanup_queue(struct mmc_queue *mq)
 	mmc_queue_reqs_free_bufs(mq);
 	kfree(mq->mqrq);
 	mq->mqrq = NULL;
+
+	if (mmc_use_blk_mq())
+		blk_mq_free_tag_set(&mq->tag_set);
 
 	mq->card = NULL;
 }
@@ -425,7 +519,8 @@ void mmc_queue_suspend(struct mmc_queue *mq)
 		blk_stop_queue(q);
 		spin_unlock_irqrestore(q->queue_lock, flags);
 
-		down(&mq->thread_sem);
+		if (!mmc_use_blk_mq())
+			down(&mq->thread_sem);
 	}
 }
 
@@ -441,7 +536,8 @@ void mmc_queue_resume(struct mmc_queue *mq)
 	if (mq->flags & MMC_QUEUE_SUSPENDED) {
 		mq->flags &= ~MMC_QUEUE_SUSPENDED;
 
-		up(&mq->thread_sem);
+		if (!mmc_use_blk_mq())
+			up(&mq->thread_sem);
 
 		spin_lock_irqsave(q->queue_lock, flags);
 		blk_start_queue(q);

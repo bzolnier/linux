@@ -2436,12 +2436,16 @@ static int mmc_test_ongoing_transfer(struct mmc_test_card *test,
 	} while (repeat_cmd && R1_CURRENT_STATE(status) != R1_STATE_TRAN);
 
 	/* Wait for data request to complete */
-	if (use_areq) {
-		mmc_start_req(host, NULL, &blkstat);
-		if (blkstat != MMC_BLK_SUCCESS)
-			ret = RESULT_FAIL;
-	} else {
-		mmc_wait_for_req_done(test->card->host, mrq);
+	if (mmc_use_blk_mq())
+		wait_for_completion(&mrq->completion);
+	else {
+		if (use_areq) {
+			mmc_start_req(host, NULL, &blkstat);
+			if (blkstat != MMC_BLK_SUCCESS)
+				ret = RESULT_FAIL;
+		} else {
+			mmc_wait_for_req_done(test->card->host, mrq);
+		}
 	}
 
 	/*

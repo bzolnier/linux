@@ -46,6 +46,11 @@ struct mmc_queue {
 	int			qdepth;
 	int			qcnt;
 	unsigned long		qslots;
+
+	atomic_t		device_busy;
+
+	/* Block layer tags. */
+	struct blk_mq_tag_set	tag_set;
 };
 
 extern int mmc_init_queue(struct mmc_queue *, struct mmc_card *, spinlock_t *,

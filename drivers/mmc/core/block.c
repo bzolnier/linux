@@ -27,6 +27,7 @@
 #include <linux/errno.h>
 #include <linux/hdreg.h>
 #include <linux/kdev_t.h>
+#include <linux/blk-mq.h>
 #include <linux/blkdev.h>
 #include <linux/mutex.h>
 #include <linux/scatterlist.h>
@@ -131,9 +132,13 @@ static int get_card_status(struct mmc_card *card, u32 *status, int retries);
 
 static void mmc_blk_requeue(struct request_queue *q, struct request *req)
 {
-	spin_lock_irq(q->queue_lock);
-	blk_requeue_request(q, req);
-	spin_unlock_irq(q->queue_lock);
+	if (mmc_use_blk_mq())
+		blk_mq_requeue_request(req, false);
+	else {
+		spin_lock_irq(q->queue_lock);
+		blk_requeue_request(q, req);
+		spin_unlock_irq(q->queue_lock);
+	}
 }
 
 static struct mmc_blk_data *mmc_blk_get(struct gendisk *disk)
@@ -1150,7 +1155,8 @@ int mmc_access_rpmb(struct mmc_queue *mq)
 	return false;
 }
 
-static int mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req)
+static int mmc_blk_issue_discard_rq(struct mmc_queue *mq, struct request *req,
+				    struct mmc_queue_req *mqrq)
 {
 	struct mmc_blk_data *md = mq->blkdata;
 	struct mmc_card *card = md->queue.card;
@@ -1188,13 +1194,19 @@ out:
 		goto retry;
 	if (!err)
 		mmc_blk_reset_success(md, type);
-	blk_end_request(req, err, blk_rq_bytes(req));
+	if (mmc_use_blk_mq()) {
+		mmc_put_card(card);
+		mmc_queue_req_free(mq, mqrq);
+		blk_mq_end_request(req, err);
+	} else
+		blk_end_request(req, err, blk_rq_bytes(req));
 
 	return err ? 0 : 1;
 }
 
 static int mmc_blk_issue_secdiscard_rq(struct mmc_queue *mq,
-				       struct request *req)
+				       struct request *req,
+				       struct mmc_queue_req *mqrq)
 {
 	struct mmc_blk_data *md = mq->blkdata;
 	struct mmc_card *card = md->queue.card;
@@ -1255,12 +1267,18 @@ out_retry:
 	if (!err)
 		mmc_blk_reset_success(md, type);
 out:
-	blk_end_request(req, err, blk_rq_bytes(req));
+	if (mmc_use_blk_mq()) {
+		mmc_put_card(card);
+		mmc_queue_req_free(mq, mqrq);
+		blk_mq_end_request(req, err);
+	} else
+		blk_end_request(req, err, blk_rq_bytes(req));
 
 	return err ? 0 : 1;
 }
 
-static int mmc_blk_issue_flush(struct mmc_queue *mq, struct request *req)
+static int mmc_blk_issue_flush(struct mmc_queue *mq, struct request *req,
+			       struct mmc_queue_req *mqrq)
 {
 	struct mmc_blk_data *md = mq->blkdata;
 	struct mmc_card *card = md->queue.card;
@@ -1270,7 +1288,12 @@ static int mmc_blk_issue_flush(struct mmc_queue *mq, struct request *req)
 	if (ret)
 		ret = -EIO;
 
-	blk_end_request_all(req, ret);
+	if (mmc_use_blk_mq()) {
+		mmc_put_card(card);
+		mmc_queue_req_free(mq, mqrq);
+		blk_mq_end_request(req, ret);
+	} else
+		blk_end_request_all(req, ret);
 
 	return ret ? 0 : 1;
 }
@@ -1368,6 +1391,11 @@ static enum mmc_blk_status mmc_blk_err_check(struct mmc_card *card,
 			gen_err = true;
 		}
 
+		if (mmc_use_blk_mq()) {
+			mdelay(100);
+			pr_info("%s: mdelay(100)\n", __func__);
+			return MMC_BLK_SUCCESS;
+		}
 		err = card_busy_detect(card, MMC_BLK_TIMEOUT_MS, false, req,
 					&gen_err);
 		if (err)
@@ -1600,7 +1628,8 @@ static int mmc_blk_cmd_err(struct mmc_blk_data *md, struct mmc_card *card,
 	return ret;
 }
 
-static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
+static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc,
+			       struct mmc_queue_req *mqrq)
 {
 	struct mmc_blk_data *md = mq->blkdata;
 	struct mmc_card *card = md->queue.card;
@@ -1612,7 +1641,10 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 	struct request *req;
 	struct mmc_async_req *areq;
 
-	if (rqc) {
+	if (mmc_use_blk_mq())
+		mqrq_cur = mqrq;
+
+	if (!mmc_use_blk_mq() && rqc) {
 		mqrq_cur = mmc_queue_req_find(mq, rqc);
 		if (!mqrq_cur) {
 			WARN_ON(1);
@@ -1644,9 +1676,15 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 			areq = &mqrq_cur->mmc_active;
 		} else
 			areq = NULL;
-		areq = mmc_start_req(card->host, areq, &status);
+		if (mmc_use_blk_mq())
+			areq = mmc_mq_start_req(card->host, areq,
+						&status, mqrq);
+		else
+			areq = mmc_start_req(card->host, areq, &status);
 		if (!areq)
 			return 0;
+		if (mmc_use_blk_mq())
+			goto out_mq;
 
 		mq_rq = container_of(areq, struct mmc_queue_req, mmc_active);
 		brq = &mq_rq->brq;
@@ -1745,6 +1783,7 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 
 	mmc_queue_req_free(mq, mq_rq);
 
+ out_mq:
 	return 1;
 
  cmd_abort:
@@ -1772,20 +1811,33 @@ static int mmc_blk_issue_rw_rq(struct mmc_queue *mq, struct request *rqc)
 	return 0;
 }
 
-int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
+int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req,
+		     struct mmc_queue_req *mqrq)
 {
 	int ret;
 	struct mmc_blk_data *md = mq->blkdata;
 	struct mmc_card *card = md->queue.card;
 
-	if (req && !mq->qcnt)
+	if (mmc_use_blk_mq()) {
 		/* claim host only for the first request */
 		mmc_get_card(card);
+
+		blk_mq_start_request(req);
+	} else {
+		if (req && !mq->qcnt)
+			/* claim host only for the first request */
+			mmc_get_card(card);
+	}
 
 	ret = mmc_blk_part_switch(card, md);
 	if (ret) {
 		if (req) {
-			blk_end_request_all(req, -EIO);
+			if (mmc_use_blk_mq()) {
+				mmc_put_card(card);
+				mmc_queue_req_free(req->q->queuedata, mqrq);
+				blk_mq_end_request(req, -EIO);
+			} else
+				blk_end_request_all(req, -EIO);
 		}
 		ret = 0;
 		goto out;
@@ -1793,26 +1845,26 @@ int mmc_blk_issue_rq(struct mmc_queue *mq, struct request *req)
 
 	if (req && req_op(req) == REQ_OP_DISCARD) {
 		/* complete ongoing async transfer before issuing discard */
-		if (mq->qcnt)
-			mmc_blk_issue_rw_rq(mq, NULL);
-		ret = mmc_blk_issue_discard_rq(mq, req);
+		if (!mmc_use_blk_mq() && mq->qcnt)
+			mmc_blk_issue_rw_rq(mq, NULL, NULL);
+		ret = mmc_blk_issue_discard_rq(mq, req, mqrq);
 	} else if (req && req_op(req) == REQ_OP_SECURE_ERASE) {
 		/* complete ongoing async transfer before issuing secure erase*/
-		if (mq->qcnt)
-			mmc_blk_issue_rw_rq(mq, NULL);
-		ret = mmc_blk_issue_secdiscard_rq(mq, req);
+		if (!mmc_use_blk_mq() && mq->qcnt)
+			mmc_blk_issue_rw_rq(mq, NULL, NULL);
+		ret = mmc_blk_issue_secdiscard_rq(mq, req, mqrq);
 	} else if (req && req_op(req) == REQ_OP_FLUSH) {
 		/* complete ongoing async transfer before issuing flush */
-		if (mq->qcnt)
-			mmc_blk_issue_rw_rq(mq, NULL);
-		ret = mmc_blk_issue_flush(mq, req);
+		if (!mmc_use_blk_mq() && mq->qcnt)
+			mmc_blk_issue_rw_rq(mq, NULL, NULL);
+		ret = mmc_blk_issue_flush(mq, req, mqrq);
 	} else {
-		ret = mmc_blk_issue_rw_rq(mq, req);
+		ret = mmc_blk_issue_rw_rq(mq, req, mqrq);
 	}
 
 out:
 	/* Release host when there are no more requests */
-	if (!mq->qcnt)
+	if (!mmc_use_blk_mq() && !mq->qcnt)
 		mmc_put_card(card);
 	return ret;
 }

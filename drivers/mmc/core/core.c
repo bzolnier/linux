@@ -29,6 +29,8 @@
 #include <linux/random.h>
 #include <linux/slab.h>
 #include <linux/of.h>
+#include <linux/kernel.h>
+#include <linux/blk-mq.h>
 
 #include <linux/mmc/card.h>
 #include <linux/mmc/host.h>
@@ -44,6 +46,7 @@
 #include "host.h"
 #include "sdio_bus.h"
 #include "pwrseq.h"
+#include "queue.h"
 
 #include "mmc_ops.h"
 #include "sd_ops.h"
@@ -420,6 +423,78 @@ static void mmc_wait_done(struct mmc_request *mrq)
 	complete(&mrq->completion);
 }
 
+static void mmc_post_req(struct mmc_host *host, struct mmc_request *mrq,
+			 int err);
+
+/*
+ * mmc_wait_done() - done callback for request
+ * @mrq: done request
+ *
+ * Wakes up mmc context, passed as a callback to host controller driver
+ */
+static void mmc_mq_wait_done(struct mmc_request *mrq)
+{
+	struct mmc_host *host = mrq->host;
+	struct mmc_queue_req *mq_rq = mrq->mqrq;
+	struct mmc_async_req *areq = NULL;
+	struct mmc_command *cmd;
+	int err = 0, ret = 0;
+
+	cmd = mrq->cmd;
+
+	if (mq_rq)
+		areq = &mq_rq->mmc_active;
+
+	if (!cmd->error || !cmd->retries ||
+	    mmc_card_removed(host->card)) {
+		if (mq_rq &&
+		    mq_rq->req->cmd_type == REQ_TYPE_FS &&
+		    req_op(mq_rq->req) != REQ_OP_DISCARD &&
+		    req_op(mq_rq->req) != REQ_OP_FLUSH) {
+			err = areq->err_check(host->card, areq);
+			BUG_ON(err != MMC_BLK_SUCCESS);
+		}
+	} else {
+		mmc_retune_recheck(host);
+		pr_info("%s: req failed (CMD%u): %d, retrying...\n",
+			mmc_hostname(host),
+			cmd->opcode, cmd->error);
+		cmd->retries--;
+		cmd->error = 0;
+		__mmc_start_request(host, mrq);
+		return;
+	}
+
+	mmc_retune_release(host);
+
+	if (mq_rq &&
+	    mq_rq->req->cmd_type == REQ_TYPE_FS &&
+	     req_op(mq_rq->req) != REQ_OP_DISCARD &&
+	     req_op(mq_rq->req) != REQ_OP_FLUSH) {
+		mmc_post_req(host, mrq, 0);
+	}
+
+	complete(&mrq->completion);
+
+	if (mq_rq &&
+	    mq_rq->req->cmd_type == REQ_TYPE_FS &&
+	    req_op(mq_rq->req) != REQ_OP_DISCARD &&
+	    req_op(mq_rq->req) != REQ_OP_FLUSH) {
+		struct mmc_blk_request *brq = &mq_rq->brq;
+		struct request *req = mq_rq->req;
+		int bytes;
+
+		mmc_queue_bounce_post(mq_rq);
+
+		bytes = brq->data.bytes_xfered;
+		mmc_put_card(host->card);
+		mmc_queue_req_free(req->q->queuedata, mq_rq);
+		ret = blk_update_request(req, 0, bytes);
+		if (!ret)
+			__blk_mq_end_request(req, 0);
+	}
+}
+
 static inline void mmc_wait_ongoing_tfr_cmd(struct mmc_host *host)
 {
 	struct mmc_request *ongoing_mrq = READ_ONCE(host->ongoing_mrq);
@@ -463,14 +538,20 @@ static int __mmc_start_data_req(struct mmc_host *host, struct mmc_request *mrq)
 	return err;
 }
 
-static int __mmc_start_req(struct mmc_host *host, struct mmc_request *mrq)
+static int __mmc_start_req(struct mmc_host *host, struct mmc_request *mrq,
+			   struct mmc_queue_req *mqrq)
 {
 	int err;
 
 	mmc_wait_ongoing_tfr_cmd(host);
 
 	init_completion(&mrq->completion);
-	mrq->done = mmc_wait_done;
+	if (mmc_use_blk_mq()) {
+		mrq->done = mmc_mq_wait_done;
+		mrq->host = host;
+		mrq->mqrq = mqrq;
+	} else
+		mrq->done = mmc_wait_done;
 
 	init_completion(&mrq->cmd_completion);
 
@@ -478,7 +559,10 @@ static int __mmc_start_req(struct mmc_host *host, struct mmc_request *mrq)
 	if (err) {
 		mrq->cmd->error = err;
 		mmc_complete_cmd(mrq);
-		complete(&mrq->completion);
+		if (mmc_use_blk_mq())
+			mmc_mq_wait_done(mrq);
+		else
+			complete(&mrq->completion);
 	}
 
 	return err;
@@ -591,7 +675,7 @@ EXPORT_SYMBOL(mmc_wait_for_req_done);
  */
 bool mmc_is_req_done(struct mmc_host *host, struct mmc_request *mrq)
 {
-	if (host->areq)
+	if (!mmc_use_blk_mq() && host->areq)
 		return host->context_info.is_done_rcv;
 	else
 		return completion_done(&mrq->completion);
@@ -709,6 +793,24 @@ struct mmc_async_req *mmc_start_req(struct mmc_host *host,
 }
 EXPORT_SYMBOL(mmc_start_req);
 
+struct mmc_async_req *mmc_mq_start_req(struct mmc_host *host,
+				       struct mmc_async_req *areq,
+				       enum mmc_blk_status *ret_stat,
+				       struct mmc_queue_req *mqrq)
+{
+	int start_err = 0;
+
+	mmc_pre_req(host, areq->mrq);
+
+	start_err = __mmc_start_req(host, areq->mrq, mqrq);
+
+	if (ret_stat)
+		*ret_stat = MMC_BLK_SUCCESS;
+
+	return areq;
+}
+EXPORT_SYMBOL(mmc_mq_start_req);
+
 /**
  *	mmc_wait_for_req - start a request and wait for completion
  *	@host: MMC host to start command
@@ -723,10 +825,14 @@ EXPORT_SYMBOL(mmc_start_req);
  */
 void mmc_wait_for_req(struct mmc_host *host, struct mmc_request *mrq)
 {
-	__mmc_start_req(host, mrq);
+	__mmc_start_req(host, mrq, NULL);
 
-	if (!mrq->cap_cmd_during_tfr)
-		mmc_wait_for_req_done(host, mrq);
+	if (!mrq->cap_cmd_during_tfr) {
+		if (mmc_use_blk_mq())
+			wait_for_completion(&mrq->completion);
+		else
+			mmc_wait_for_req_done(host, mrq);
+	}
 }
 EXPORT_SYMBOL(mmc_wait_for_req);
 

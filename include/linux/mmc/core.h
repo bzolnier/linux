@@ -141,6 +141,7 @@ struct mmc_data {
 };
 
 struct mmc_host;
+struct mmc_queue_req;
 struct mmc_request {
 	struct mmc_command	*sbc;		/* SET_BLOCK_COUNT for multiblock */
 	struct mmc_command	*cmd;
@@ -154,6 +155,8 @@ struct mmc_request {
 
 	/* Allow other commands during this ongoing data transfer or busy wait */
 	bool			cap_cmd_during_tfr;
+
+	struct mmc_queue_req	*mqrq;
 };
 
 struct mmc_card;
@@ -164,6 +167,10 @@ extern int mmc_read_bkops_status(struct mmc_card *);
 extern struct mmc_async_req *mmc_start_req(struct mmc_host *,
 					   struct mmc_async_req *,
 					   enum mmc_blk_status *);
+extern struct mmc_async_req *mmc_mq_start_req(struct mmc_host *,
+					   struct mmc_async_req *,
+					   enum mmc_blk_status *,
+					   struct mmc_queue_req *);
 extern int mmc_interrupt_hpi(struct mmc_card *);
 extern void mmc_wait_for_req(struct mmc_host *, struct mmc_request *);
 extern void mmc_wait_for_req_done(struct mmc_host *host,
@@ -233,5 +240,10 @@ static inline void mmc_claim_host(struct mmc_host *host)
 struct device_node;
 extern u32 mmc_vddrange_to_ocrmask(int vdd_min, int vdd_max);
 extern int mmc_of_parse_voltage(struct device_node *np, u32 *mask);
+
+static inline bool mmc_use_blk_mq(void)
+{
+	return 1;
+}
 
 #endif /* LINUX_MMC_CORE_H */
